@@ -21,6 +21,7 @@ const claimQuery = `
 SELECT id, event_type, payload, destination_url, status, attempts_count, last_error, next_attempt_at, created_at
 FROM jobs
 WHERE status = 'pending' AND next_attempt_at <= now()
+ORDER BY next_attempt_at
 FOR UPDATE SKIP LOCKED
 LIMIT 1
 `
@@ -48,6 +49,9 @@ func (s *Store) WithClaimedJob(ctx context.Context, fn func(*domain.Job) domain.
 	if err := applyOutcome(ctx, tx, job.ID, outcome); err != nil {
 		return false, err
 	}
+	// If Commit fails here (e.g. Postgres dies right after a successful
+	// delivery), the job stays pending and is retried — an accepted
+	// at-least-once duplicate, not a bug.
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
@@ -78,7 +82,13 @@ func claimJob(ctx context.Context, tx *sql.Tx) (*domain.Job, error) {
 func applyOutcome(ctx context.Context, tx *sql.Tx, jobID string, outcome domain.Outcome) error {
 	switch outcome.Status {
 	case domain.StatusDelivered:
-		_, err := tx.ExecContext(ctx, `UPDATE jobs SET status = 'delivered' WHERE id = $1`, jobID)
+		_, err := tx.ExecContext(ctx, `
+			UPDATE jobs SET
+				attempts_count = attempts_count + 1,
+				status = 'delivered',
+				last_error = NULL
+			WHERE id = $1`,
+			jobID)
 		return err
 	case domain.StatusPending:
 		_, err := tx.ExecContext(ctx, `

@@ -6,11 +6,14 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"net/http"
 	"time"
 
 	"powens-challenge/internal/domain"
 )
+
+const maxDrainBytes = 64 << 10
 
 type Deliverer struct {
 	client *http.Client
@@ -34,7 +37,9 @@ func (d *Deliverer) Deliver(ctx context.Context, job *domain.Job) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer func() { _ = resp.Body.Close() }()
+	// Drain (bounded) before closing so http.Transport can reuse the connection.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes))
+	_ = resp.Body.Close()
 	return resp.StatusCode, nil
 }
 

@@ -9,10 +9,12 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"powens-challenge/internal/config"
+	"powens-challenge/internal/httpapi"
 	"powens-challenge/internal/httpclient"
 	"powens-challenge/internal/postgres"
 	"powens-challenge/internal/worker"
@@ -30,28 +32,23 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	db, err := sql.Open("pgx", cfg.DatabaseURL)
+	db, err := openDB(ctx, cfg)
 	if err != nil {
 		log.Fatalf("open database: %v", err)
 	}
 	defer func() { _ = db.Close() }()
 
-	if err := db.PingContext(ctx); err != nil {
-		log.Fatalf("connect to database: %v", err)
-	}
-	db.SetMaxOpenConns(cfg.Concurrency + 2)
-
 	store := postgres.NewStore(db)
 	deliverer := httpclient.NewDeliverer(cfg.DeliveryTimeout, []byte(cfg.HMACSecret))
+	wg := startWorkers(ctx, cfg, store, deliverer)
 
-	var wg sync.WaitGroup
-	for i := 0; i < cfg.Concurrency; i++ {
-		wg.Go(func() {
-			worker.Run(ctx, store, deliverer, cfg.MaxAttempts, cfg.DeliveryTimeout)
-		})
+	srv := &http.Server{
+		Addr:              cfg.Addr,
+		Handler:           httpapi.NewMux(db),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
 	}
-
-	srv := &http.Server{Addr: cfg.Addr, Handler: http.NewServeMux()}
 	serverErr := make(chan error, 1)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -83,4 +80,26 @@ func main() {
 	case <-done:
 	case <-shutdownCtx.Done():
 	}
+}
+
+func openDB(ctx context.Context, cfg config.Config) (*sql.DB, error) {
+	db, err := sql.Open("pgx", cfg.DatabaseURL)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.PingContext(ctx); err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(cfg.Concurrency + 2)
+	return db, nil
+}
+
+func startWorkers(ctx context.Context, cfg config.Config, store worker.Store, deliverer worker.Deliverer) *sync.WaitGroup {
+	var wg sync.WaitGroup
+	for i := 0; i < cfg.Concurrency; i++ {
+		wg.Go(func() {
+			worker.Run(ctx, store, deliverer, cfg.MaxAttempts, cfg.DeliveryTimeout)
+		})
+	}
+	return &wg
 }

@@ -9,10 +9,12 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"powens-challenge/internal/config"
+	"powens-challenge/internal/httpapi"
 	"powens-challenge/internal/httpclient"
 	"powens-challenge/internal/postgres"
 	"powens-challenge/internal/worker"
@@ -51,7 +53,13 @@ func main() {
 		})
 	}
 
-	srv := &http.Server{Addr: cfg.Addr, Handler: http.NewServeMux()}
+	srv := &http.Server{
+		Addr:              cfg.Addr,
+		Handler:           httpapi.NewMux(db),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+	}
 	serverErr := make(chan error, 1)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

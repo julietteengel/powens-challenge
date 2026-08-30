@@ -39,7 +39,7 @@ You should get back `{"id":"<uuid>"}` with a `201`. Watch it get delivered:
 
 ```bash
 docker compose logs -f testreceiver
-# webhook id=<uuid> signature_valid=true body={"amount":4200,"currency":"EUR"}
+# webhook id=<uuid> signature_valid=true body={"amount": 4200, "currency": "EUR"}
 ```
 
 To see a retry-then-dead-letter cycle, post a job with an unreachable

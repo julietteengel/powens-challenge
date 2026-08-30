@@ -47,18 +47,23 @@ func main() {
 	var wg sync.WaitGroup
 	for i := 0; i < cfg.Concurrency; i++ {
 		wg.Go(func() {
-			worker.Run(ctx, store, deliverer, cfg.MaxAttempts)
+			worker.Run(ctx, store, deliverer, cfg.MaxAttempts, cfg.DeliveryTimeout)
 		})
 	}
 
 	srv := &http.Server{Addr: cfg.Addr, Handler: http.NewServeMux()}
+	serverErr := make(chan error, 1)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("listen: %v", err)
+			serverErr <- err
 		}
 	}()
 
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case err := <-serverErr:
+		log.Printf("listen: %v", err)
+	}
 	stop()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownGracePeriod)

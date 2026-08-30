@@ -80,7 +80,7 @@ type deadJob struct {
 }
 
 func (h *Handler) listDeadJobs(w http.ResponseWriter, r *http.Request) {
-	if status := r.URL.Query().Get("status"); status != "dead" {
+	if r.URL.Query().Get("status") != "dead" {
 		writeError(w, newValidationError(`only status=dead is supported`))
 		return
 	}

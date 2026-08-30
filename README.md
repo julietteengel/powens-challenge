@@ -39,7 +39,7 @@ You should get back `{"id":"<uuid>"}` with a `201`. Watch it get delivered:
 
 ```bash
 docker compose logs -f testreceiver
-# webhook id=<uuid> signature_valid=true body={"amount": 4200, "currency": "EUR"}
+# webhook id=<uuid> signature_valid=true body="{\"amount\": 4200, \"currency\": \"EUR\"}"
 ```
 
 To see a retry-then-dead-letter cycle, post a job with an unreachable
@@ -258,6 +258,11 @@ budget for this exercise:
   some managed providers tighten it. If ever deployed on one, it should be set
   well above the HTTP delivery timeout — never below, or Postgres would kill a
   perfectly normal in-flight delivery's transaction.
+- **Real secrets management for `docker-compose.yml`.** The Postgres password
+  and HMAC secret in there are throwaway local-dev placeholders (the Postgres
+  instance is recreated fresh on every `up`, reachable only from localhost) —
+  fine for a zero-config local demo, not for anything real. A real deployment
+  would pull these from a secrets manager or `.env` file, never commit them.
 
 ## What the AI got wrong
 

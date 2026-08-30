@@ -34,7 +34,7 @@ func main() {
 		got := r.Header.Get("X-Webhook-Signature")
 		valid := hmac.Equal([]byte(expected), []byte(got))
 
-		log.Printf("webhook id=%s signature_valid=%v body=%s", r.Header.Get("X-Webhook-Id"), valid, body)
+		log.Printf("webhook id=%s signature_valid=%v body=%q", r.Header.Get("X-Webhook-Id"), valid, body)
 		w.WriteHeader(http.StatusOK)
 	})
 

@@ -2,7 +2,7 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: postgres # local-only placeholder, recreated fresh on every `up`, not a real secret
       POSTGRES_DB: webhooks
     ports:
       - "55432:5432" # non-default host port: 5432/5433 are both common local Postgres ports already; this one isn't

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" driver used by sql.Open
 
 	"powens-challenge/internal/domain"
 )

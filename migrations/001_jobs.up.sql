@@ -3,7 +3,8 @@ CREATE TABLE jobs (
     event_type      TEXT NOT NULL,
     payload         JSON NOT NULL, -- not JSONB: preserves exact input bytes for HMAC canonicalization
     destination_url TEXT NOT NULL,
-    status          TEXT NOT NULL DEFAULT 'pending', -- pending | delivered | dead
+    status          TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'delivered', 'dead')),
     attempts_count  INT NOT NULL DEFAULT 0,
     last_error      TEXT,
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),

@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: webhooks
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./migrations/001_jobs.up.sql:/docker-entrypoint-initdb.d/001_jobs.up.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      target: dispatcher
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/webhooks?sslmode=disable
+      HMAC_SECRET: local-dev-secret
+      WORKER_CONCURRENCY: "10"
+      ADDR: ":8080"
+    ports:
+      - "8080:8080"
+    stop_grace_period: 30s
+
+  testreceiver:
+    build:
+      context: .
+      target: testreceiver
+    environment:
+      HMAC_SECRET: local-dev-secret
+      ADDR: ":9000"
+    ports:
+      - "9000:9000"

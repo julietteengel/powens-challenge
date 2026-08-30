@@ -11,6 +11,6 @@ func newValidationError(msg string) error {
 }
 
 func isValidationError(err error) bool {
-	var ve *validationError
-	return errors.As(err, &ve)
+	_, ok := errors.AsType[*validationError](err)
+	return ok
 }

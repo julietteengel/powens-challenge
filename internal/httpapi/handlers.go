@@ -1,9 +1,17 @@
 package httpapi
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"time"
+)
+
+const (
+	maxBodyBytes   = 1 << 20 // 1MB, generous for a webhook payload
+	dbQueryTimeout = 5 * time.Second
 )
 
 type Handler struct {
@@ -29,8 +37,14 @@ type createJobResponse struct {
 }
 
 func (h *Handler) createJob(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+
 	var req createJobRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		writeError(w, newValidationError("invalid JSON body"))
 		return
 	}
@@ -39,8 +53,11 @@ func (h *Handler) createJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx, cancel := context.WithTimeout(r.Context(), dbQueryTimeout)
+	defer cancel()
+
 	var id string
-	err := h.db.QueryRowContext(r.Context(), `
+	err := h.db.QueryRowContext(ctx, `
 		INSERT INTO jobs (event_type, payload, destination_url)
 		VALUES ($1, $2, $3)
 		RETURNING id`,
@@ -68,7 +85,10 @@ func (h *Handler) listDeadJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := h.db.QueryContext(r.Context(), `
+	ctx, cancel := context.WithTimeout(r.Context(), dbQueryTimeout)
+	defer cancel()
+
+	rows, err := h.db.QueryContext(ctx, `
 		SELECT id, event_type, destination_url, attempts_count, last_error
 		FROM jobs WHERE status = 'dead'`)
 	if err != nil {

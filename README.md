@@ -110,6 +110,11 @@ original setup) — fine for this demo, where nothing real is protected by
 either value. A real deployment would pull both from an actual secrets
 manager, never from a flat file at all.
 
+`.env` is read by `docker-compose` only — `make test` runs `go test`
+directly, which never reads it. If you change `POSTGRES_PASSWORD` in
+`.env`, update `TEST_DATABASE_URL` to match, or `make test` will fail to
+connect with a confusing auth error instead of an obvious one.
+
 ### Ports
 
 `docker-compose.yml` exposes Postgres on host port `55432`, not the default

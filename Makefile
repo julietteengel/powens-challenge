@@ -1,7 +1,10 @@
 .PHONY: up down test
 
-up:
+up: .env
 	docker compose up --build
+
+.env:
+	cp .env.example .env
 
 down:
 	docker compose down

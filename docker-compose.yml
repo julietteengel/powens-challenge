@@ -2,7 +2,7 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_PASSWORD: postgres # local-only placeholder, recreated fresh on every `up`, not a real secret
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: webhooks
     ports:
       - "55432:5432" # non-default host port: 5432/5433 are both common local Postgres ports already; this one isn't
@@ -22,8 +22,8 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/webhooks?sslmode=disable
-      HMAC_SECRET: local-dev-secret
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/webhooks?sslmode=disable
+      HMAC_SECRET: ${HMAC_SECRET}
       WORKER_CONCURRENCY: "10"
       ADDR: ":8080"
     ports:
@@ -35,7 +35,7 @@ services:
       context: .
       target: testreceiver
     environment:
-      HMAC_SECRET: local-dev-secret
+      HMAC_SECRET: ${HMAC_SECRET}
       ADDR: ":9000"
     ports:
       - "9000:9000"

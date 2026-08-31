@@ -43,8 +43,17 @@ docker compose logs -f testreceiver
 ```
 
 To see a retry-then-dead-letter cycle, post a job with an unreachable
-destination (e.g. `http://localhost:1/`), wait for `MAX_ATTEMPTS` (default 5)
-attempts with growing backoff between them, then:
+destination:
+
+```bash
+curl -X POST localhost:8080/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"event_type":"payment.failed","payload":{"x":1},"destination_url":"http://localhost:1/"}'
+```
+
+Wait for `MAX_ATTEMPTS` (default 5) attempts with growing backoff between
+them — usually under 30 seconds, since backoff is jittered and capped — then
+check it landed in the dead-letter list:
 
 ```bash
 curl "localhost:8080/jobs?status=dead"
@@ -52,9 +61,12 @@ curl "localhost:8080/jobs?status=dead"
 
 Run the tests. The claim-concurrency test needs a real Postgres — start it
 first, or `make test` fails fast with a clear "is `make up` running?" message
-rather than a silent false pass:
+rather than a silent false pass. `make up` creates `.env` automatically on
+first run (see [Secrets](#secrets) below); starting Postgres standalone
+without ever having run `make up` needs that same step first:
 
 ```bash
+cp .env.example .env            # skip if you've already run `make up` once
 docker compose up -d postgres   # if `make up` isn't already running
 make test
 ```
@@ -81,11 +93,29 @@ except the first two:
 | `ADDR` | `:8080` | HTTP listen address |
 | `TEST_DATABASE_URL` | `postgres://postgres:postgres@localhost:55432/webhooks?sslmode=disable` | Used only by `make test` |
 
+### Secrets
+
+`docker-compose.yml` doesn't hardcode `POSTGRES_PASSWORD` or `HMAC_SECRET` —
+it reads them from a `.env` file (Docker Compose's built-in variable
+substitution), which is gitignored and never committed. `make up` creates one
+from `.env.example` automatically if it doesn't exist yet; to do it manually:
+
+```bash
+cp .env.example .env
+```
+
+The default values are throwaway local-dev placeholders (see
+[What the AI got wrong](#what-the-ai-got-wrong) for why this wasn't the
+original setup) — fine for this demo, where nothing real is protected by
+either value. A real deployment would pull both from an actual secrets
+manager, never from a flat file at all.
+
+### Ports
+
 `docker-compose.yml` exposes Postgres on host port `55432`, not the default
 `5432`: a Postgres already running locally on the default port (common on a
 backend developer's machine) would otherwise silently intercept connections
-meant for this project's container — found by actually running the
-concurrency test, see [What the AI got wrong](#what-the-ai-got-wrong).
+meant for this project's container.
 
 ## Architecture overview
 
@@ -174,43 +204,72 @@ Three concrete, code-level sources of duplication:
    the whole transaction, including that `UPDATE`, is rolled back even though
    the delivery had already genuinely succeeded.
 
+None of these three are prevented, only made safe: every attempt carries the
+same `X-Webhook-Id`, so **the receiver must deduplicate on it** — this
+dispatcher holds up its half of that contract, not the other half. In
+production, whoever owns the receiving endpoint has to actually implement
+that check.
+
 ### Retry strategy
 
-Not every failure is retried the same way. `isRetryable` classifies: a network
-error, timeout, `5xx`, or `429` is transient and retried; any other `4xx`
-(bad payload, invalid URL, auth failure) is treated as terminal immediately —
-retrying a structurally broken request would just burn the whole backoff
-schedule before reaching the same conclusion available on attempt one.
+Two separate questions: **which failures deserve a retry**, and **how long to
+wait before retrying**.
 
-Backoff is full-jitter exponential: `delay = random(0, min(cap, base *
-2^(attempt-1)))`, `base=2s`, `cap=5min`. Plain exponential backoff without
-jitter would make every failing job toward the same destination retry at
-exactly the same instant (thundering herd); jitter spreads that out for
-negligible extra code.
+**Which failures retry** — a network error, a timeout, a `5xx`, or a `429`
+might well succeed on the next try: nothing was wrong with the request
+itself. But any other `4xx` (bad payload, invalid URL, refused auth) means
+the request itself is broken — retrying the exact same broken request
+won't fix it, it just burns through all `MAX_ATTEMPTS` to reach a
+conclusion already known on the first try. So `isRetryable` treats those two
+cases differently: retry the first kind, mark the second `dead` right away.
 
-After `MAX_ATTEMPTS` a still-retryable failure is finally marked `dead` too.
-All of this — success detection, classification, the attempts threshold, the
-backoff calculation — lives in one pure function, `domain.DecideOutcome`. The
-SQL layer never recomputes any of it; it only executes one of three plain
-`UPDATE` statements for an outcome already decided.
+**How long to wait** — exponential backoff (`2s, 4s, 8s, 16s...`, capped at
+5 minutes), but with a random delay between 0 and that value each time
+(*full jitter*), not the exact value. Without that randomness, every job
+failing toward the same destination at the same moment would all retry
+again at the exact same instant, hammering it right when it's already
+struggling (a "thundering herd"). Jitter spreads retries out over time for
+almost no extra code.
+
+After `MAX_ATTEMPTS`, even a transient failure finally gives up and is
+marked `dead`.
+
+All four of these decisions — was it a success, is it retryable, has it hit
+the limit, how long to wait — are made together in one function,
+`domain.DecideOutcome`, with no database or network calls inside it. The SQL
+layer never re-derives any of this; it only saves a decision that's already
+been made.
 
 ### Concurrency model
 
-`WORKER_CONCURRENCY` independent goroutines each run the same
-claim-deliver-persist loop; `FOR UPDATE SKIP LOCKED` is the only coordination
-mechanism between them — no in-memory dispatcher, no semaphore, no broker.
+`WORKER_CONCURRENCY` (default 10) is how many jobs can be delivered at the
+same time. That's implemented as that many goroutines, each running the
+exact same loop on its own: try to grab one job, deliver it, save the
+result, repeat.
 
-`db.SetMaxOpenConns(WORKER_CONCURRENCY + 2)` matters more than it looks: each
-worker holds one connection for the duration of its transaction, so the pool
-needs at least that many, and the `+2` keeps the HTTP API from starving while
-every worker is mid-delivery. Without this explicit call, changing
-`WORKER_CONCURRENCY` would silently have no effect once past the connection
-pool's own default size — a real footgun if left unconfigured.
+**How they avoid grabbing the same job** — there's no coordinator handing
+out work. Each goroutine just asks Postgres for "one pending job I can
+have" (`FOR UPDATE SKIP LOCKED`), and Postgres itself guarantees that two
+goroutines asking at the same time never get the same row. That's the
+entire coordination mechanism — nothing built in Go, no in-memory
+scheduler, no lock file.
 
-This model also scales to multiple instances of the binary with zero code
-change, since `SKIP LOCKED` coordinates just as well across processes as
-across goroutines in one process — not needed at this scale, but not blocked
-by this design either.
+**Why the connection pool size has to match** — normally a database
+connection is only busy for the fraction of a second a query takes. Here,
+each worker keeps its connection tied up for its *entire* delivery attempt
+— including the HTTP call to the destination, which can take up to
+`DELIVERY_TIMEOUT` (10s by default). So with 10 workers, at least 10
+database connections need to be available at once, or some workers would
+just sit waiting for a free connection instead of actually delivering
+anything — `WORKER_CONCURRENCY=50` would silently behave like a much lower
+number. `db.SetMaxOpenConns(WORKER_CONCURRENCY + 2)` sets the pool large
+enough for all the workers, plus a couple of spare connections so the HTTP
+API isn't left waiting when every worker is busy at once.
+
+**A side benefit, not something this project needs today**: since the
+coordination lives entirely in Postgres, running two copies of this binary
+at once would work correctly with zero code changes — they'd naturally
+never grab the same job either.
 
 ### Infrastructure introduced
 
@@ -224,130 +283,104 @@ app never starts against a not-yet-ready database.
 Each of these is deliberately documented rather than built, given the time
 budget for this exercise:
 
-- **Idempotency-Key at ingestion.** A caller retrying `POST /jobs` after a
-  network timeout can currently create two distinct jobs for the same event,
-  each with its *own* `X-Webhook-Id` — invisible to the dedup contract above,
-  which only covers duplicates created by *this service's own* retries. Fix:
-  an optional `Idempotency-Key` header, a `UNIQUE` constraint, and
-  `INSERT ... ON CONFLICT DO NOTHING RETURNING id` (return the existing job
-  with `200` instead of creating a new one), the standard pattern from Stripe
-  and similar APIs.
-- **Per-client HMAC secret**, not one global secret — in a real multi-tenant
-  Powens, a secret compromised for one client would expose every other
-  client's webhooks.
-- **`destination_url` validation against SSRF.** Not validated today, on the
-  assumption that this dispatcher is only ever called internally by trusted
-  Powens services. A dispatcher reachable by external or less-trusted callers
-  would need an allowlist, re-checked at call time (not just at job creation)
-  to defend against DNS rebinding.
-- **A message broker, past a clear threshold** — if throughput outgrows what
-  Postgres polling comfortably absorbs, or another service needs to consume
-  the same event stream. Should always ship together with an Outbox Pattern,
-  never introduced alone.
-- **PgBouncer transaction-mode pooling doesn't fit this design as-is** — a
-  transaction held open for the duration of an external HTTP call defeats the
-  point of a transaction-mode pooler at real scale.
-- **A manual requeue endpoint for dead jobs** — currently read-only by design.
-  Adding one would need its `UPDATE` re-guarded with `WHERE status='dead'` to
-  avoid racing a worker's legitimate retry of the same row.
-- **`LISTEN`/`NOTIFY`** to cut new-job pickup latency from the polling
-  interval (currently 500ms) to near-zero, without adding infrastructure —
-  skipped because the benefit isn't measurable at this volume.
-- **Tune `idle_in_transaction_session_timeout` on managed Postgres.** Disabled
-  by default on vanilla Postgres (and in this project's Docker image), but
-  some managed providers tighten it. If ever deployed on one, it should be set
-  well above the HTTP delivery timeout — never below, or Postgres would kill a
-  perfectly normal in-flight delivery's transaction.
-- **Real secrets management for `docker-compose.yml`.** The Postgres password
-  and HMAC secret in there are throwaway local-dev placeholders (the Postgres
-  instance is recreated fresh on every `up`, reachable only from localhost) —
-  fine for a zero-config local demo, not for anything real. A real deployment
-  would pull these from a secrets manager or `.env` file, never commit them.
+- **Idempotency-Key at ingestion.** Retrying `POST /jobs` after a timeout can
+  create two jobs for the same event — a gap the `X-Webhook-Id` dedup
+  contract doesn't cover. Fix: an `Idempotency-Key` header, a `UNIQUE`
+  constraint, `INSERT ... ON CONFLICT DO NOTHING` (Stripe's pattern).
+- **Per-client HMAC secret**, not one global one — today, a secret leaked for
+  one client exposes every client's webhooks.
+- **`destination_url` validation against SSRF.** Skipped, assuming only
+  trusted internal Powens services call this. An externally-reachable
+  dispatcher would need an allowlist, checked on every call, not just at
+  creation, to prevent DNS rebinding.
+- **A message broker**, once volume outgrows Postgres polling or another
+  service needs the same events — always paired with an Outbox Pattern,
+  never added alone.
+- **PgBouncer's transaction-mode pooling doesn't fit this design** — holding
+  a transaction open for an entire HTTP call defeats the point of it at
+  scale.
+- **A manual requeue endpoint for dead jobs** — read-only today by design.
+  Would need `WHERE status='dead'` on its `UPDATE` to avoid racing a
+  worker's own retry.
+- **`LISTEN`/`NOTIFY`** to cut pickup latency below the 500ms polling
+  interval — skipped, no measurable benefit at this volume.
+- **Check `idle_in_transaction_session_timeout` on managed Postgres.** This
+  setting makes Postgres kill any transaction that sits open without running
+  a query for too long — meant to catch buggy clients that forget to close a
+  transaction. Ours looks exactly like that on purpose: while waiting for the
+  destination to respond, the transaction is open but no SQL is running.
+  Vanilla Postgres (and this project's Docker image) disables this by
+  default, so it's a non-issue here — but some managed providers turn it on
+  with a low value. If ever deployed there, it must be raised well above
+  `DELIVERY_TIMEOUT`, or Postgres would kill perfectly healthy deliveries
+  mid-flight, mistaking them for a stuck client.
+- **Real secrets management.** `docker-compose.yml` reads secrets from a
+  gitignored `.env` now (see [Secrets](#secrets)) — enough to stop
+  committing them, not enough for production, which needs an actual secrets
+  manager, not a flat file.
 
 ## What the AI got wrong
 
-Tracked as they happened rather than reconstructed afterward. Grouped by how
-they were found, because that turned out to be the more interesting axis:
+Grouped by how each was found — that turned out more interesting than
+grouping by topic.
 
-**Reversed after being challenged on principle, before any code existed:**
+**Decided on principle, reversed after being challenged:**
 
-- The original design used a short claim plus a visibility-timeout window,
-  justified by "the external HTTP call's duration isn't reliably bounded."
-  That premise became false the moment an outbound HTTP timeout was set for
-  an unrelated reason (stopping a silent destination from freezing a worker
-  forever) — but nothing prompted revisiting the earlier decision until asked
-  to. Once replayed, the long-held-transaction design won outright: it closes
-  an entire class of duplicates and recovers from a crash immediately.
-- Whether to implement an `Idempotency-Key` at ingestion flip-flopped four
-  times, each round arguing principle (consistency with "no over-engineering,"
-  "the one duplicate no existing contract catches") instead of the one
-  question that actually settled it: how much time it would cost against a
-  budget of a few hours for the whole exercise. That question should have
-  come first, not fourth.
-- A defensive `idempotency_key UNIQUE` column was left in the schema after
-  deciding not to build the feature, "in case there's time later" — a column
-  never written to announces a feature that doesn't exist, which is worse
-  than simply not mentioning it. Removed; it can come back with the code.
-- The cost of the claim-concurrency test was overestimated (45–60 minutes
-  quoted, ~20–25 actual) and nearly used as the reason to cut the one test
-  that verifies the system's central claim about concurrency safety.
+- The original design claimed a job with a short lock plus a
+  visibility-timeout window, justified by "the HTTP call isn't reliably
+  bounded." That stopped being true once a delivery timeout was added for
+  an unrelated reason — nobody revisited the decision until asked to.
+  Replayed, holding the transaction open for the whole delivery won
+  outright: it closes a whole class of duplicates and recovers from a crash
+  instantly.
+- Whether to build an `Idempotency-Key` at ingestion flip-flopped four
+  times, argued each time on principle instead of the one question that
+  actually settled it: the time cost. That should have come first.
+- A defensive `idempotency_key UNIQUE` column stayed in the schema after
+  deciding not to build the feature, "in case there's time." A column never
+  written to announces a feature that doesn't exist — removed.
+- The concurrency test's cost was overestimated (45–60 min quoted, ~20–25
+  actual) and nearly used as the reason to cut the one test that verifies
+  the system's core safety claim.
 
-**Bugs caught by review, before or after being written:**
+**Bugs caught by review:**
 
-- The single most consequential one: the "is this job dead or does it retry"
-  rule was duplicated into a SQL `CASE` statement, despite an
-  already-agreed rule to keep all business logic in the domain layer.
-  Concretely, this is what let `next_attempt_at` get advanced even on a job
-  that was simultaneously marked `dead` in the same statement — a bug that
-  disappeared structurally, not just cosmetically, once the rule was moved
-  into one pure function (`DecideOutcome`) and the SQL reduced to three plain
-  `UPDATE`s with no conditional logic left to desynchronize.
-- A function signature with three consecutive `int` parameters
-  (`DecideOutcome(currentAttempts, maxAttempts, statusCode int, ...)`) — the
-  kind of shape where a swapped argument order compiles fine and fails
-  silently. Fixed by passing the `*Job` itself instead of a bare int.
-- The `Store` interface originally returned a raw `*sql.Tx` to the `worker`
-  package, leaking `database/sql` into a layer meant to stay ignorant of
-  Postgres and making it impossible to fake in a test without a real
-  database. Fixed by inverting control:
-  `WithClaimedJob(ctx, fn) (claimed bool, err error)`.
-- `ORDER BY next_attempt_at` was missing from the claim query — not an
-  analysis gap, an execution one: the need for it was already written down in
-  research notes before the SQL was finalized, and still didn't make it into
-  the query until a dedicated code review caught it.
-- The outbound response body wasn't drained before `Close()` (defeats HTTP
-  connection reuse under load), and the worker used `context.Background()`
-  for the claim/delivery transaction — removing every time bound on
-  `BeginTx`/`Commit`, not just the HTTP call, and quietly defeating the point
-  of the shutdown grace period. Fixed with `context.WithoutCancel(ctx)` plus
-  a local `context.WithTimeout`.
-- A migration was written without its `down` counterpart, conflating "no
-  migration tool needed" (true, given the scope) with "no need for a
-  reversible schema file" (false — a `DROP TABLE` costs one line and is
-  useful even for manually resetting a local dev database).
-- The project rule was "one line per exported identifier, nothing by default
-  on unexported ones, never restate what the code already says." The first
-  three domain files written (`job.go`, `backoff.go`, `outcome.go`) carried
-  multi-sentence comments on almost every type and function regardless — the
-  rule existed before the code did, but wasn't applied while writing it.
-  Trimmed back to the budget across all three files.
+- The most consequential one: the retry-vs-dead rule lived in a SQL `CASE`
+  as well as in Go, breaking an already-agreed rule to keep business logic
+  in one place. It's exactly what let `next_attempt_at` advance on jobs
+  simultaneously marked `dead`. Fixed by moving the whole decision into one
+  function (`DecideOutcome`), reducing the SQL to three plain `UPDATE`s.
+- `DecideOutcome`'s first draft took three consecutive `int` arguments — a
+  shape where swapped arguments compile fine and fail silently. Fixed by
+  passing `*Job` instead.
+- `Store` originally returned a raw `*sql.Tx` to the `worker` package,
+  leaking Postgres into a layer meant to stay ignorant of it and making it
+  untestable without a real database. Fixed by inverting control:
+  `WithClaimedJob(ctx, fn)`.
+- `ORDER BY next_attempt_at` was missing from the claim query — already
+  flagged in research notes before the SQL was written, and still missed
+  until a dedicated review caught it.
+- The response body wasn't drained before `Close()` (blocks connection
+  reuse), and the worker used `context.Background()` for its transaction —
+  removing every time bound, not just the HTTP call, quietly defeating the
+  shutdown grace period. Fixed with `context.WithoutCancel(ctx)` plus a
+  local timeout.
+- A migration shipped without its `down` file, conflating "no migration
+  tool needed" with "no need for a reversible schema file."
+- The comment rule ("one line per exported identifier, nothing else")
+  existed before the first domain files were written, but wasn't followed
+  writing them. Trimmed after the fact.
 
-**Found only by running things, never by reading the code:**
+**Found by being asked the right question:**
 
-- A hardcoded Postgres host port (`5432` in `docker-compose.yml`) collided
-  with a completely unrelated Postgres already running locally on this
-  machine. No code review would ever have caught this — the YAML is valid,
-  `docker compose up` reports no error, and nothing in the Go code is at
-  fault. It only surfaced by actually running the claim-concurrency test
-  against real infrastructure. The stake wasn't a demo: it's the evaluator's
-  own first `make up`, on a machine that, being a backend developer's, has a
-  decent chance of already having Postgres on that same default port. Fixed
-  by exposing Postgres on `55432` instead — deliberately not `5433` either,
-  since that's itself the conventional second choice a developer reaches for.
+- The Postgres password and HMAC secret were hardcoded in the committed
+  `docker-compose.yml`. A scan flagged it; the reply was "fine, this
+  Postgres is thrown away every run, nothing real is exposed" — true, but
+  it dodged the actual question, asked afterward: if someone else clones
+  this repo, where do *their* secrets come from? They didn't — everyone
+  got the same committed value. Fixed with a gitignored `.env` instead.
 
-**The one recurring pattern worth naming:** three separate times above (the
-`Idempotency-Key` reversals, the concurrency test near-cut, the leftover
-schema column), a decision got made on an argument of principle without
-checking the concrete fact underneath it — the actual time cost, what the
-test would actually verify, whether the column would actually be used.
-Principle alone was a consistently bad substitute for checking.
+**The pattern worth naming:** several of the reversals above were decided
+on principle without checking the concrete fact underneath — the actual
+time cost, what a test would verify, whether a column would ever be used.
+Principle was a consistently bad substitute for checking.
